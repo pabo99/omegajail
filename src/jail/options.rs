@@ -208,7 +208,11 @@ impl JailOptions {
         };
 
         let mut execve_args = Vec::<String>::new();
-        let mut env: Vec<&str> = vec!["HOME=/home", "LANG=en_US.UTF-8", "PATH=/usr/bin"];
+        let mut env: Vec<String> = vec![
+            String::from("HOME=/home"),
+            String::from("LANG=en_US.UTF-8"),
+            String::from("PATH=/usr/bin"),
+        ];
         let mut seccomp_profile_name = String::new();
         let mut extra_memory_size_in_bytes = DEFAULT_EXTRA_MEMORY_SIZE_IN_BYTES;
         let mut vm_memory_size_in_bytes = 0u64;
@@ -470,11 +474,16 @@ impl JailOptions {
                 }
                 args::Language::Go => {
                     seccomp_profile_name = String::from("go-build");
-                    // Go defaults its build cache to $HOME/.cache/go-build,
-                    // which is not always writable in runner integrations.
-                    create_dir_all(homedir.join(".cache/go-build"))
-                        .context("create Go build cache")?;
-                    env.push("GOCACHE=/home/.cache/go-build");
+                    // Go defaults its build cache to $HOME/.cache/go-build.
+                    // Make that cache explicit and writable in both sandboxed
+                    // and unsandboxed runner integrations.
+                    let go_build_cache = homedir.join(".cache/go-build");
+                    create_dir_all(&go_build_cache).context("create Go build cache")?;
+                    env.push(if args.disable_sandboxing {
+                        format!("GOCACHE={}", go_build_cache.to_string_lossy())
+                    } else {
+                        String::from("GOCACHE=/home/.cache/go-build")
+                    });
                     mounts.push(MountArgs {
                         source: Some(root.join("root-go")),
                         target: rootfs.join("opt/go"),
@@ -780,7 +789,7 @@ impl JailOptions {
                         String::from("/usr/lib/dotnet/dotnet"),
                         format!("{}.dll", &args.run_target),
                     ]);
-                    env.push("DOTNET_CLI_TELEMETRY_OPTOUT=1");
+                    env.push(String::from("DOTNET_CLI_TELEMETRY_OPTOUT=1"));
                 }
             }
         }
@@ -835,7 +844,7 @@ impl JailOptions {
                 .iter()
                 .map(|s| CString::new(s.clone()))
                 .try_collect()?,
-            env: env.iter().map(|s| CString::new(*s)).try_collect()?,
+            env: env.iter().map(|s| CString::new(s.as_str())).try_collect()?,
             seccomp_bpf_filter_notify_contents: seccomp_bpf_filter_notify_contents,
             seccomp_bpf_filter_sigsys_contents: seccomp_bpf_filter_sigsys_contents,
             seccomp_profile_name: seccomp_profile_name,
@@ -892,8 +901,7 @@ mod tests {
     use super::JailOptions;
     use crate::args;
 
-    #[test]
-    fn test_go_compile_uses_writable_build_cache() -> Result<()> {
+    fn go_compile_options(disable_sandboxing: bool) -> Result<(JailOptions, TempDir)> {
         let tmp_dir = TempDir::new("go-compile-options")?;
         let root = tmp_dir.path().join("root");
         let homedir = tmp_dir.path().join("home");
@@ -922,17 +930,40 @@ mod tests {
             output_limit: Some(10485760),
             memory_limit: None,
             cgroup_path: String::from("/omegajail"),
-            disable_sandboxing: true,
+            disable_sandboxing: disable_sandboxing,
             bind: vec![],
             allow_sigsys_fallback: true,
             extra_args: vec![],
         })?;
+
+        Ok((options, tmp_dir))
+    }
+
+    #[test]
+    fn test_go_compile_uses_writable_build_cache() -> Result<()> {
+        let (options, tmp_dir) = go_compile_options(false)?;
+        let homedir = tmp_dir.path().join("home");
 
         assert!(options
             .env
             .iter()
             .any(|env| env.to_bytes() == b"GOCACHE=/home/.cache/go-build"));
         assert!(homedir.join(".cache/go-build").is_dir());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unsandboxed_go_compile_uses_host_build_cache() -> Result<()> {
+        let (options, tmp_dir) = go_compile_options(true)?;
+        let go_build_cache = tmp_dir.path().join("home/.cache/go-build");
+        let expected_env = format!("GOCACHE={}", go_build_cache.to_string_lossy());
+
+        assert!(options
+            .env
+            .iter()
+            .any(|env| env.to_bytes() == expected_env.as_bytes()));
+        assert!(go_build_cache.is_dir());
 
         Ok(())
     }
